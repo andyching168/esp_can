@@ -4,11 +4,20 @@
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 
-/* * 硬體腳位定義 (ESP32-S3)
- * 請根據您的實際接線修改
- */
-#define CAN0_INT 9   // INT pin (雖然本範例用 polling，但定義著備用)
+// ============================================
+// 硬體腳位定義 (ESP32-S3)
+// ============================================
 #define CAN0_CS  10  // CS pin
+
+// ESP32-S3 SPI 腳位
+#define SPI_SCK  12
+#define SPI_MISO 13
+#define SPI_MOSI 11
+
+// MCP2515 設定
+#define MCP2515_CLOCK MCP_8MHZ
+#define CAN_SPEED CAN_500KBPS
+#define SPI_SPEED 500000
 
 // 初始化 CAN 物件
 MCP_CAN CAN0(CAN0_CS);
@@ -17,147 +26,95 @@ MCP_CAN CAN0(CAN0_CS);
 USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
 
-// 前向宣告，避免在 loop 中呼叫時找不到定義
-void handleCanMessage(unsigned char *data);
-
 void setup() {
-  // 開啟 Serial 方便除錯 (透過 USB CDC)
   Serial.begin(115200);
+  delay(2000);
   
+  Serial.println();
+  Serial.println("=== ESP32-S3 CAN to USB Keyboard ===");
+
   // 啟動 USB HID
   Keyboard.begin();
   ConsumerControl.begin();
   USB.begin();
 
-  // 初始化 CAN Bus
-  // 注意: MCP_ANY 表示接收所有 ID，MCP_8MHZ 是震盪器頻率 (請確認您的模組是 8MHz 還是 16MHz)
-  // 500KBPS 是您之前提到的速率
-  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-    Serial.println("MCP2515 Initialized Successfully!");
+  // 設定 SPI 腳位和速度
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, CAN0_CS);
+  SPI.setFrequency(SPI_SPEED);
+
+  // 初始化 MCP2515
+  if (CAN0.begin(MCP_ANY, CAN_SPEED, MCP2515_CLOCK) == CAN_OK) {
+    Serial.println("MCP2515 Init OK!");
   } else {
-    Serial.println("Error Initializing MCP2515...");
-    while(1); // 初始化失敗就停在這裡
+    Serial.println("MCP2515 Init Failed!");
   }
   
-  // 設定成正常模式
   CAN0.setMode(MCP_NORMAL);
+  Serial.println("Ready!");
 }
 
-// 用來記錄上一次的按鍵狀態，避免重複觸發(如果需要的話)
-// 但針對這種飛梭旋鈕，通常收到一次訊號就送一次按鍵最單純
+unsigned char lastData[8] = {0};
+
 void loop() {
   long unsigned int rxId;
   unsigned char len = 0;
-  unsigned char rxBuf[8];
+  unsigned char rxBuf[8] = {0};
 
-  // 檢查是否有收到 CAN 訊息
-  if(CAN0.checkReceive() == CAN_MSGAVAIL) {
-    
+  if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+    memset(rxBuf, 0, 8);
     CAN0.readMsgBuf(&rxId, &len, rxBuf);
-
+    
     // 只處理 ID 0x475
-    if(rxId == 0x475) {
-      handleCanMessage(rxBuf);
+    if (rxId == 0x475) {
+      // 檢查資料是否有變化
+      if (memcmp(rxBuf, lastData, 8) == 0) return;
+      memcpy(lastData, rxBuf, 8);
+      
+      // 全 0 = 沒按任何鍵
+      bool allZero = true;
+      for (int i = 0; i < 8; i++) {
+        if (rxBuf[i] != 0) { allZero = false; break; }
+      }
+      if (allZero) return;
+      
+      // ==========================================
+      // Byte 0: 六大功能鍵 -> 數字鍵 1-6
+      // ==========================================
+      if (rxBuf[0] == 0x80) { Serial.println("左上 -> 1"); Keyboard.press('1'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[0] == 0x40) { Serial.println("左中 -> 2"); Keyboard.press('2'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[0] == 0x20) { Serial.println("左下 -> 3"); Keyboard.press('3'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[0] == 0x10) { Serial.println("右上 -> 4"); Keyboard.press('4'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[0] == 0x08) { Serial.println("右中 -> 5"); Keyboard.press('5'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[0] == 0x04) { Serial.println("右下 -> 6"); Keyboard.press('6'); delay(50); Keyboard.releaseAll(); }
+      
+      // ==========================================
+      // Byte 1: 旋鈕與方向
+      // ==========================================
+      if (rxBuf[1] == 0x40) { Serial.println("飛梭左旋 -> ,"); Keyboard.press(','); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x20) { Serial.println("飛梭右旋 -> ."); Keyboard.press('.'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x02) { Serial.println("方向上"); Keyboard.press(KEY_UP_ARROW); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x04) { Serial.println("方向下"); Keyboard.press(KEY_DOWN_ARROW); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x08) { Serial.println("方向左"); Keyboard.press(KEY_LEFT_ARROW); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x10) { Serial.println("方向右"); Keyboard.press(KEY_RIGHT_ARROW); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x60) { Serial.println("Enter"); Keyboard.press(KEY_RETURN); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[1] == 0x01) { Serial.println("Radio -> R"); Keyboard.press('r'); delay(50); Keyboard.releaseAll(); }
+      
+      // ==========================================
+      // Byte 2: 系統模式
+      // ==========================================
+      if (rxBuf[2] == 0x80) { Serial.println("NAVI -> N"); Keyboard.press('n'); delay(50); Keyboard.releaseAll(); }
+      
+      // ==========================================
+      // Byte 3: 媒體控制
+      // ==========================================
+      if (rxBuf[3] == 0x20) { Serial.println("Play/Pause"); ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE); ConsumerControl.release(); }
+      
+      // ==========================================
+      // Byte 6: 方向盤按鍵
+      // ==========================================
+      if (rxBuf[6] == 0x80) { Serial.println("Voice -> V"); Keyboard.press('v'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[6] == 0x40) { Serial.println("接通 -> C"); Keyboard.press('c'); delay(50); Keyboard.releaseAll(); }
+      if (rxBuf[6] == 0x20) { Serial.println("掛斷 -> D"); Keyboard.press('d'); delay(50); Keyboard.releaseAll(); }
     }
-  }
-}
-
-void handleCanMessage(unsigned char *data) {
-  // Debug: 印出收到的數據
-  Serial.print("Data: ");
-  for(int i=0; i<8; i++) {
-    Serial.printf("%02X ", data[i]);
-  }
-  Serial.println();
-
-  // ==========================================
-  // Byte 1: 旋鈕與方向 (對應 Android 常用的導航鍵)
-  // ==========================================
-  
-  // 飛梭左旋 (模擬 Volume Down 或 Left)
-  if (data[1] == 0x40) {
-    ConsumerControl.press(HID_KEY_COMMA);
-    ConsumerControl.release();
-  }
-  // 飛梭右旋 (模擬 Volume Up 或 Right)
-  else if (data[1] == 0x20) {
-    ConsumerControl.press(HID_KEY_PERIOD);
-    ConsumerControl.release();
-  }
-  // 方向上
-  else if (data[1] == 0x02) {
-    Keyboard.press(KEY_UP_ARROW);
-    delay(50); Keyboard.releaseAll();
-  }
-  // 方向下
-  else if (data[1] == 0x04) {
-    Keyboard.press(KEY_DOWN_ARROW);
-    delay(50); Keyboard.releaseAll();
-  }
-  // 方向左
-  else if (data[1] == 0x08) {
-    Keyboard.press(KEY_LEFT_ARROW);
-    delay(50); Keyboard.releaseAll();
-  }
-  // 方向右
-  else if (data[1] == 0x10) {
-    Keyboard.press(KEY_RIGHT_ARROW);
-    delay(50); Keyboard.releaseAll();
-  }
-  // Enter 鍵 (0x60)
-  else if (data[1] == 0x60) {
-    Keyboard.press(KEY_RETURN);
-    delay(50); Keyboard.releaseAll();
-  }
-  // Radio 鍵 (對應 Home 或 音樂)
-  else if (data[1] == 0x01) {
-    ConsumerControl.press(HID_KEY_R); // 回首頁
-    ConsumerControl.release();
-  }
-
-  // ==========================================
-  // Byte 3: 媒體控制
-  // ==========================================
-  if (data[3] == 0x20) { // Play/Pause
-    ConsumerControl.press(CONSUMER_CONTROL_PLAY_PAUSE);
-    ConsumerControl.release();
-  }
-
-  // ==========================================
-  // Byte 6: 方向盤按鍵
-  // ==========================================
-  if (data[6] == 0x80) { // Voice
-    // Android 通常用 Search 鍵或特定的 Consumer Key 喚醒語音助理
-    ConsumerControl.press(HID_KEY_V); 
-    ConsumerControl.release();
-  }
-  else if (data[6] == 0x40) { // 接通
-    // 這個鍵在電腦鍵盤沒有標準對應，通常我們會映射到 F1 或特殊功能鍵
-    // 讓 Android 車機軟體去抓
-    Keyboard.press(HID_KEY_C); 
-    delay(50); Keyboard.releaseAll();
-  }
-  else if (data[6] == 0x20) { // 掛斷
-    Keyboard.press(HID_KEY_D);
-    delay(50); Keyboard.releaseAll();
-  }
-
-  // ==========================================
-  // Byte 0: 六大功能鍵 (自定義映射到 F3~F8)
-  // ==========================================
-  // 為了讓 Button Mapper 容易抓取，我們將這些特殊功能鍵映射到 F 鍵
-  if (data[0] == 0x80) { Keyboard.press(HID_KEY_1); delay(50); Keyboard.releaseAll(); } // 左上
-  if (data[0] == 0x40) { Keyboard.press(HID_KEY_2); delay(50); Keyboard.releaseAll(); } // 左中
-  if (data[0] == 0x20) { Keyboard.press(HID_KEY_3); delay(50); Keyboard.releaseAll(); } // 左下
-  if (data[0] == 0x10) { Keyboard.press(HID_KEY_4); delay(50); Keyboard.releaseAll(); } // 右上
-  if (data[0] == 0x08) { Keyboard.press(HID_KEY_5); delay(50); Keyboard.releaseAll(); } // 右中
-  if (data[0] == 0x04) { Keyboard.press(HID_KEY_6); delay(50); Keyboard.releaseAll(); } // 右下
-
-  // ==========================================
-  // Byte 2: 系統模式 (Mode)
-  // ==========================================
-  if (data[2] == 0x80) { // NAVI -> 開啟地圖?
-    ConsumerControl.press(HID_KEY_N); // 範例：對應下一首
-    ConsumerControl.release();
   }
 }
